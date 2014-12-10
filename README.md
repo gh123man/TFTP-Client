@@ -1,4 +1,4 @@
-#FTP Client
+#TFTP Client
 Originally written for a class project.
 
 Supports all RFC 1350 functions with the exception of write requests.
