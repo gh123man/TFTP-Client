@@ -11,8 +11,8 @@ using System.Collections;
 
 ///
 /// Brian Floersch (bpf4935@rit.edu)
-///
-/// This class connects to a TFTP server and transfers files.
+/// 
+/// This class connects to a TFTP server and transfers files. 
 namespace TFTP {
 
     /// <summary>
@@ -22,12 +22,14 @@ namespace TFTP {
 
         // Response codes
         private static readonly byte[] REQUEST = new byte[] { 0x0, 0x01 };
+        private static readonly byte[] REQERROR = new byte[] { 0x0, 0x02 };
         private static readonly byte[] DATA = new byte[] { 0x0, 0x03 };
         private static readonly byte[] ACK = new byte[] { 0x0, 0x04 };
         private static readonly byte[] ERROR = new byte[] { 0x0, 0x05 };
+        private static readonly byte[] NACK = new byte[] { 0x0, 0x06 };
         private static readonly byte[] ASCII_ZERO = new byte[] { 0x0 };
 
-        private static readonly int SECONDS_30 = 30000;
+        private static readonly int SECONDS_30 = 3000;
 
         /// <summary>
         /// Delegate for error handling
@@ -43,6 +45,7 @@ namespace TFTP {
         private BinaryWriter mBinWriter;
         private ErrorHandler mErrorHandler;
         private Timer mTimer;
+        private HammingDecoder mDetector;
 
         /// <summary>
         /// Constructor
@@ -51,6 +54,7 @@ namespace TFTP {
         public TftpClient(ErrorHandler handler) {
             mUdpClient = new UdpClient();
             mErrorHandler = handler;
+            mDetector = new HammingDecoder();
         }
 
         /// <summary>
@@ -61,21 +65,25 @@ namespace TFTP {
         /// <param name="file"></param>
         /// <param name="transferMode"></param>
         /// <param name="fileOut"></param>
-        public void requestFile(String host, int port, String file, string transferMode, FileStream fileOut) {
+        public void requestFile(String host, int port, String file, bool error, FileStream fileOut) {
             mFileStream = fileOut;
             mBinWriter = new BinaryWriter(mFileStream);
             try {
                 mServerAddress = System.Net.Dns.GetHostAddresses(host)[0];
-            } catch (SocketException e) {
+            } catch (SocketException) {
                 mErrorHandler(-1, "Host not found!");
             }
             mEndpoint = new IPEndPoint(mServerAddress, port);
-            tftpSend(formatRequest(file, transferMode));
+            if (error) {
+                tftpSend(formatErrorRequest(file, "octet"));
+            } else {
+                tftpSend(formatRequest(file, "octet"));
+            }
             recieveResponse();
         }
 
         /// <summary>
-        /// waits and handles the inital server response until the file is downloaded.
+        /// waits and handles the inital server response until the file is downloaded. 
         /// </summary>
         private void recieveResponse() {
             Boolean done = false;
@@ -84,32 +92,37 @@ namespace TFTP {
             while (!done) {
                 var newEndpoint = new IPEndPoint(IPAddress.Any, 0);
                 byte[] response = mUdpClient.Receive(ref newEndpoint);
+
                 mEndpoint = newEndpoint;
 
                 var type = getResponseType(response);
 
                 if (type.SequenceEqual(DATA)) {
-
                     int currentBlock = getblockNumber(response);
 
                     if (currentBlock == (block + 1)) {
-
                         if (mTimer != null) {
                             mTimer.Change(Timeout.Infinite, Timeout.Infinite);
                             mTimer.Dispose();
                         }
-
-                        block = currentBlock;
+                        
                         var data = getDataBlock(response);
-                        mBinWriter.Write(data);
 
-                        if (data.Length < 512) {
-                            done = true;
+                        if (mDetector.tryDecode(ref data)) {
+                            block = currentBlock;
+                            if (data.Length < 384) {
+                                done = true;
+                                data = removeTrailingNullBytes(data);
+                            }
+
+                            mBinWriter.Write(data);
+
+                            tftpSend(formatACK(getDatablockNumberAsByte(response)));
+                            setAckTimer(response);
+                        } else {
+                            tftpSend(formatNACK(getDatablockNumberAsByte(response)));
+                            setNAckTimer(response);
                         }
-
-                        tftpSend(formatACK(getDatablockNumberAsByte(response)));
-
-                        setAckTimer(response);
                     }
 
                 } else if (type.SequenceEqual(ERROR)) {
@@ -133,12 +146,29 @@ namespace TFTP {
         }
 
         /// <summary>
-        /// used as a callback to re-send an ack.
+        /// Sets the NACK command timer on a new thread
+        /// </summary>
+        /// <param name="response"></param>
+        public void setNAckTimer(object response) {
+            mTimer = new Timer(new TimerCallback(resendNack), response, SECONDS_30, 0);
+        }
+
+        /// <summary>
+        /// used as a callback to re-send an ack. 
         /// </summary>
         /// <param name="response"></param>
         public void resendAck(Object response) {
             tftpSend(formatACK(getDatablockNumberAsByte((byte[])response)));
             setAckTimer(response);
+        }
+
+        /// <summary>
+        /// used as a callback to re-send an NACK. 
+        /// </summary>
+        /// <param name="response"></param>
+        public void resendNack(Object response) {
+            tftpSend(formatNACK(getDatablockNumberAsByte((byte[])response)));
+            setNAckTimer(response);
         }
 
         /// <summary>
@@ -194,6 +224,10 @@ namespace TFTP {
             return concatByteArrays(ACK, block);
         }
 
+        private static byte[] formatNACK(byte[] block) {
+            return concatByteArrays(NACK, block);
+        }
+
         /// <summary>
         /// formats a request
         /// </summary>
@@ -205,7 +239,17 @@ namespace TFTP {
         }
 
         /// <summary>
-        /// Concats byte arrays into one byte array.
+        /// Formats a request for errorful data
+        /// </summary>
+        /// <param name="fileName"></param>
+        /// <param name="transferMode"></param>
+        /// <returns></returns>
+        private static byte[] formatErrorRequest(String fileName, String transferMode) {
+            return concatByteArrays(REQERROR, Encoding.ASCII.GetBytes(fileName), ASCII_ZERO, Encoding.ASCII.GetBytes(transferMode), ASCII_ZERO);
+        }
+
+        /// <summary>
+        /// Concats byte arrays into one byte array. 
         /// </summary>
         /// <param name="inByteArrays"></param>
         /// <returns></returns>
@@ -218,6 +262,19 @@ namespace TFTP {
                 finalByteArray = tmpByteArray;
             }
             return finalByteArray;
+        }
+
+        /// <summary>
+        /// Removes trailing null bytes from the stream
+        /// </summary>
+        /// <param name="data"></param>
+        /// <returns></returns>
+        private static byte[] removeTrailingNullBytes(byte[] data) {
+            var index = data.Length - 1;
+            while (data[index] == 0x00) {
+                index--;
+            }
+            return data.Take(index + 1).ToArray();
         }
 
     }
